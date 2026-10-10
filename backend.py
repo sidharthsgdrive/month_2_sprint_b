@@ -1,23 +1,8 @@
 """
 RAG Notes — FastAPI backend.
 
-Turns uploaded PDF notes into a searchable knowledge base and answers
-questions about them with retrieval-augmented generation.
-
-Pipeline
---------
-    PDF upload
-        -> text extraction (pypdf)
-        -> chunking
-        -> embedding (sentence-transformers)
-        -> vector store (ChromaDB)
-
-    User question
-        -> query embedding
-        -> semantic search over the vector store
-        -> relevant chunks assembled into context
-        -> context + question sent to an LLM (Groq)
-        -> generated answer (+ cited source chunks) returned to the client
+PDF upload -> text extraction -> chunking -> embeddings -> ChromaDB.
+Questions -> semantic retrieval -> Groq chat completions -> answer + sources.
 """
 
 import os
@@ -27,48 +12,42 @@ import tempfile
 import uuid
 from contextlib import asynccontextmanager
 from typing import List, Optional
+from urllib.parse import quote
 
 import chromadb
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
-# --------------------------------------------------------------------------- #
 # Configuration
-# --------------------------------------------------------------------------- #
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
-
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+# Groq SDK appends /chat/completions; do not add that path here.
+GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_db")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "notes")
-
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
-TOP_K = int(os.getenv("TOP_K", "4"))
+CHUNK_SIZE = max(100, int(os.getenv("CHUNK_SIZE", "1000")))
+CHUNK_OVERLAP = max(0, min(int(os.getenv("CHUNK_OVERLAP", "150")), CHUNK_SIZE - 1))
+TOP_K = max(1, int(os.getenv("TOP_K", "4")))
 
 SYSTEM_PROMPT = (
     "You are a study assistant that answers questions using ONLY the provided "
     "context from the user's uploaded notes. If the answer is not present in "
-    "the context, reply exactly: \"I don't know based on the provided notes.\" "
-    "Be concise, and mention the source file (e.g. [lecture3.pdf]) when it is "
-    "useful context for the user."
+    'the context, reply exactly: "I don\'t know based on the provided notes." '
+    "Be concise, and mention the source file (e.g. [lecture3.pdf]) when useful."
 )
 
-# --------------------------------------------------------------------------- #
-# Lazily-initialised globals (embedding model, vector store, LLM client)
-# --------------------------------------------------------------------------- #
-embedding_model: Optional[SentenceTransformer] = None
+embedding_model = None
 chroma_client = None
 collection = None
-
 groq_client = None
+
 if GROQ_API_KEY:
     from groq import Groq
 
@@ -76,7 +55,7 @@ if GROQ_API_KEY:
 
 
 def init_models() -> None:
-    """Load the embedding model and connect to the vector store (idempotent)."""
+    """Initialize embedding model and persistent Chroma collection once."""
     global embedding_model, chroma_client, collection
     if embedding_model is None:
         print(f"Loading embedding model '{EMBEDDING_MODEL_NAME}'...")
@@ -88,83 +67,76 @@ def init_models() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_models()  # warm up on startup so the first request isn't slow
+    init_models()
     yield
 
 
-# --------------------------------------------------------------------------- #
-# PDF -> text extraction
-# --------------------------------------------------------------------------- #
 def pdf_to_text(pdf_path: str) -> str:
-    """Extract plain text from a PDF, page by page, using pypdf."""
     reader = PdfReader(pdf_path)
-    pages = [page.extract_text() or "" for page in reader.pages]
-    return "\n\n".join(pages)
+    return "\n\n".join(page.extract_text() or "" for page in reader.pages)
 
 
-# --------------------------------------------------------------------------- #
-# Chunking
-# --------------------------------------------------------------------------- #
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
-    """Split text into overlapping chunks, breaking on paragraph boundaries
-    where possible so each chunk stays semantically coherent."""
+    """Split text into overlapping chunks without duplicating overlap twice."""
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if not text:
         return []
 
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    paragraphs = [part.strip() for part in text.split("\n\n") if part.strip()]
     chunks: List[str] = []
     current = ""
 
-    for para in paragraphs:
-        if len(current) + len(para) + 2 <= chunk_size:
-            current = f"{current}\n\n{para}" if current else para
-            continue
-
-        if current:
-            chunks.append(current)
-            current = ""
-
-        if len(para) > chunk_size:
-            # a single paragraph longer than chunk_size: slide a window over it
-            start = 0
-            while start < len(para):
-                chunks.append(para[start : start + chunk_size])
-                start += chunk_size - overlap
+    for paragraph in paragraphs:
+        if len(paragraph) <= chunk_size:
+            candidate = f"{current}\n\n{paragraph}" if current else paragraph
+            if len(candidate) <= chunk_size:
+                current = candidate
+            else:
+                if current:
+                    chunks.append(current)
+                current = paragraph
         else:
-            current = para
+            if current:
+                chunks.append(current)
+                current = ""
+            start = 0
+            step = chunk_size - overlap
+            while start < len(paragraph):
+                chunks.append(paragraph[start : start + chunk_size])
+                start += step
 
     if current:
         chunks.append(current)
 
     if overlap > 0 and len(chunks) > 1:
         overlapped = [chunks[0]]
-        for i in range(1, len(chunks)):
-            prev_tail = chunks[i - 1][-overlap:]
-            overlapped.append(f"{prev_tail}\n\n{chunks[i]}")
+        for index in range(1, len(chunks)):
+            # Only add overlap when the chunks do not already overlap.
+            previous_tail = chunks[index - 1][-overlap:]
+            if chunks[index].startswith(previous_tail):
+                overlapped.append(chunks[index])
+            else:
+                overlapped.append(f"{previous_tail}\n\n{chunks[index]}")
         return overlapped
-
     return chunks
 
 
 def retrieve(question: str, k: int):
-    """Embed the question and run semantic search against the vector store."""
     query_embedding = embedding_model.encode(question).tolist()
-    results = collection.query(query_embeddings=[query_embedding], n_results=k)
-    docs = results["documents"][0] if results.get("documents") else []
-    metas = results["metadatas"][0] if results.get("metadatas") else []
-    dists = results["distances"][0] if results.get("distances") else []
+    result_count = min(k, collection.count())
+    if result_count <= 0:
+        return [], [], []
+    results = collection.query(query_embeddings=[query_embedding], n_results=result_count)
+    docs = results.get("documents", [[]])[0] or []
+    metas = results.get("metadatas", [[]])[0] or []
+    dists = results.get("distances", [[]])[0] or []
     return docs, metas, dists
 
 
-# --------------------------------------------------------------------------- #
-# FastAPI app
-# --------------------------------------------------------------------------- #
 app = FastAPI(title="RAG Notes API", lifespan=lifespan)
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten this to your frontend's origin in production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -172,7 +144,7 @@ app.add_middleware(
 
 class AskRequest(BaseModel):
     question: str
-    top_k: Optional[int] = None
+    top_k: Optional[int] = Field(default=None, ge=1, le=20)
 
 
 class SourceChunk(BaseModel):
@@ -199,119 +171,136 @@ class DocumentInfo(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "groq_configured": bool(GROQ_API_KEY)}
+    return {
+        "status": "ok",
+        "groq_configured": bool(GROQ_API_KEY),
+        "model": GROQ_MODEL,
+    }
 
 
 @app.post("/upload", response_model=UploadResponse)
 async def upload_pdf(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "Only PDF files are supported.")
+    filename = file.filename or "upload.pdf"
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
     init_models()
-
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = tmp.name
-
+    tmp_path = None
     try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_path = tmp.name
+            shutil.copyfileobj(file.file, tmp)
+
         try:
             text = pdf_to_text(tmp_path)
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(500, f"Failed to extract text from PDF: {exc}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to extract text from PDF: {exc}") from exc
     finally:
-        os.unlink(tmp_path)
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        await file.close()
 
     if not text.strip():
         raise HTTPException(
-            400,
-            "No extractable text found in this PDF. It may be a scanned/image-only "
-            "document, which plain text extraction can't read.",
+            status_code=400,
+            detail="No extractable text found in this PDF. It may be scanned/image-only.",
         )
 
     chunks = chunk_text(text)
     if not chunks:
-        raise HTTPException(400, "Document produced no chunks after processing.")
+        raise HTTPException(status_code=400, detail="Document produced no chunks after processing.")
 
     embeddings = embedding_model.encode(chunks, show_progress_bar=False).tolist()
-
-    # Re-uploading the same filename replaces its previous chunks instead of
-    # duplicating them.
-    existing = collection.get(where={"source": file.filename})
+    existing = collection.get(where={"source": filename})
     if existing and existing.get("ids"):
         collection.delete(ids=existing["ids"])
 
-    ids = [f"{file.filename}-{i}-{uuid.uuid4().hex[:6]}" for i in range(len(chunks))]
-    metadatas = [{"source": file.filename, "chunk": i} for i in range(len(chunks))]
+    ids = [f"{uuid.uuid4().hex}-{index}" for index in range(len(chunks))]
+    metadatas = [{"source": filename, "chunk": index} for index in range(len(chunks))]
     collection.add(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
-
-    return UploadResponse(filename=file.filename, chunks_indexed=len(chunks))
+    return UploadResponse(filename=filename, chunks_indexed=len(chunks))
 
 
 @app.post("/ask", response_model=AskResponse)
 async def ask(request: AskRequest):
-    if not request.question.strip():
-        raise HTTPException(400, "Question must not be empty.")
+    question = request.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question must not be empty.")
     if groq_client is None:
-        raise HTTPException(500, "GROQ_API_KEY is not configured on the server.")
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured on the server.")
 
     init_models()
+    total = collection.count()
+    if total == 0:
+        raise HTTPException(status_code=400, detail="No documents have been indexed yet. Upload a PDF first.")
 
-    if collection.count() == 0:
-        raise HTTPException(400, "No documents have been indexed yet. Upload a PDF first.")
-
-    k = request.top_k or TOP_K
-    docs, metas, dists = retrieve(request.question, k)
-
+    docs, metas, distances = retrieve(question, min(request.top_k or TOP_K, total))
     if not docs:
         return AskResponse(answer="I don't know based on the provided notes.", sources=[])
 
     context_blocks = []
     sources = []
-    for doc, meta, dist in zip(docs, metas, dists):
+    for doc, meta, distance in zip(docs, metas, distances):
+        if not meta or "source" not in meta or "chunk" not in meta:
+            continue
         context_blocks.append(f"[{meta['source']} - chunk {meta['chunk']}]\n{doc}")
         sources.append(
-            SourceChunk(source=meta["source"], chunk_index=meta["chunk"], text=doc, distance=dist)
+            SourceChunk(
+                source=str(meta["source"]),
+                chunk_index=int(meta["chunk"]),
+                text=doc,
+                distance=float(distance),
+            )
         )
-    context = "\n\n---\n\n".join(context_blocks)
 
-    user_prompt = f"Context:\n{context}\n\nQuestion: {request.question}\n\nAnswer:"
+    if not context_blocks:
+        return AskResponse(answer="I don't know based on the provided notes.", sources=[])
 
-    completion = groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0,
-    )
-    answer = completion.choices[0].message.content
+    user_prompt = f"Context:\n{'\n\n---\n\n'.join(context_blocks)}\n\nQuestion: {question}\n\nAnswer:"
+    try:
+        completion = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0,
+        )
+    except Exception as exc:
+        # Keep the client-facing error actionable while details remain in server logs.
+        print(f"Groq completion failed ({type(exc).__name__}): {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Groq API request failed. Verify GROQ_BASE_URL, GROQ_API_KEY, and GROQ_MODEL. ({type(exc).__name__})",
+        ) from exc
 
+    answer = completion.choices[0].message.content or "I don't know based on the provided notes."
     return AskResponse(answer=answer, sources=sources)
 
 
 @app.get("/documents", response_model=List[DocumentInfo])
 def list_documents():
     init_models()
-    if collection.count() == 0:
-        return []
-    all_items = collection.get()
+    all_items = collection.get(include=["metadatas"])
     counts = {}
-    for meta in all_items["metadatas"]:
-        counts[meta["source"]] = counts.get(meta["source"], 0) + 1
-    return [DocumentInfo(source=src, chunks=n) for src, n in counts.items()]
+    for meta in (all_items.get("metadatas") or []):
+        if meta and meta.get("source"):
+            counts[meta["source"]] = counts.get(meta["source"], 0) + 1
+    return [DocumentInfo(source=source, chunks=count) for source, count in sorted(counts.items())]
 
 
 @app.delete("/documents/{filename}")
 def delete_document(filename: str):
     init_models()
-    existing = collection.get(where={"source": filename})
-    if not existing or not existing.get("ids"):
-        raise HTTPException(404, f"No document named '{filename}' found.")
-    collection.delete(ids=existing["ids"])
-    return {"deleted": filename, "chunks_removed": len(existing["ids"])}
+    existing = collection.get(where={"source": filename}, include=["metadatas"])
+    ids = existing.get("ids") or []
+    if not ids:
+        raise HTTPException(status_code=404, detail=f"No document named '{filename}' found.")
+    collection.delete(ids=ids)
+    return {"deleted": filename, "chunks_removed": len(ids)}
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("backend:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+    uvicorn.run("backend:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
