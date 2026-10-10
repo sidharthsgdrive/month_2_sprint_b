@@ -1,3 +1,11 @@
+"""
+RAG Notes — Streamlit frontend.
+
+Lets the user upload PDF notes and chat with them. All the real work
+(PDF -> markdown, chunking, embedding, vector search, LLM generation)
+happens in backend.py; this file only talks to that API over HTTP.
+"""
+
 import os
 
 import requests
@@ -32,8 +40,11 @@ def render_sources(sources):
 
 
 if "messages" not in st.session_state:
-    st.session_state.messages = [] 
+    st.session_state.messages = []  # [{"role", "content", "sources"}]
 
+# --------------------------------------------------------------------------- #
+# Sidebar: backend status, upload, document list
+# --------------------------------------------------------------------------- #
 with st.sidebar:
     st.title("📚 Notes Q&A")
     st.caption("Upload PDF notes, then ask questions about them.")
@@ -58,8 +69,7 @@ with st.sidebar:
                 if resp.ok:
                     data = resp.json()
                     st.success(
-                        f"Indexed {data['chunks_indexed']} chunks from "
-                        f"{data['filename']} (via {data['conversion_method']})."
+                        f"Indexed {data['chunks_indexed']} chunks from {data['filename']}."
                     )
                 else:
                     st.error(resp.json().get("detail", "Upload failed."))
@@ -86,7 +96,9 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
+# --------------------------------------------------------------------------- #
 # Main chat area
+# --------------------------------------------------------------------------- #
 st.header("Ask your notes")
 
 if not st.session_state.messages:

@@ -1,10 +1,33 @@
+"""
+RAG Notes — FastAPI backend.
+
+Turns uploaded PDF notes into a searchable knowledge base and answers
+questions about them with retrieval-augmented generation.
+
+Pipeline
+--------
+    PDF upload
+        -> text extraction (pypdf)
+        -> chunking
+        -> embedding (sentence-transformers)
+        -> vector store (ChromaDB)
+
+    User question
+        -> query embedding
+        -> semantic search over the vector store
+        -> relevant chunks assembled into context
+        -> context + question sent to an LLM (Groq)
+        -> generated answer (+ cited source chunks) returned to the client
+"""
+
 import os
 import re
 import shutil
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
-from typing import List, Optional, Tuple
+from typing import List, Optional
+
 import chromadb
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -14,7 +37,9 @@ from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
-# Config
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
@@ -26,9 +51,6 @@ COLLECTION_NAME = os.getenv("COLLECTION_NAME", "notes")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
 TOP_K = int(os.getenv("TOP_K", "4"))
-
-# Set USE_MARKER to false to use pypdf fallback (light weight)
-USE_MARKER = os.getenv("USE_MARKER", "true").lower() == "true"
 
 SYSTEM_PROMPT = (
     "You are a study assistant that answers questions using ONLY the provided "
@@ -44,7 +66,6 @@ SYSTEM_PROMPT = (
 embedding_model: Optional[SentenceTransformer] = None
 chroma_client = None
 collection = None
-_marker_converter = None
 
 groq_client = None
 if GROQ_API_KEY:
@@ -54,6 +75,7 @@ if GROQ_API_KEY:
 
 
 def init_models() -> None:
+    """Load the embedding model and connect to the vector store (idempotent)."""
     global embedding_model, chroma_client, collection
     if embedding_model is None:
         print(f"Loading embedding model '{EMBEDDING_MODEL_NAME}'...")
@@ -65,44 +87,28 @@ def init_models() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_models()  # warm up on startup 
+    init_models()  # warm up on startup so the first request isn't slow
     yield
 
-# markdown to text
-def _get_marker_converter():
-    global _marker_converter
-    if _marker_converter is None:
-        from marker.converters.pdf import PdfConverter
-        from marker.models import create_model_dict
 
-        print("Loading marker-pdf models (first call only, can take a while)...")
-        _marker_converter = PdfConverter(artifact_dict=create_model_dict())
-    return _marker_converter
-
-
-def pdf_to_markdown(pdf_path: str) -> Tuple[str, str]:
-    if USE_MARKER:
-        try:
-            from marker.output import text_from_rendered
-
-            converter = _get_marker_converter()
-            rendered = converter(pdf_path)
-            text, _, _ = text_from_rendered(rendered)
-            if text and text.strip():
-                return text, "marker-pdf"
-        except Exception as exc:  # noqa: BLE001 - deliberately broad: any
-            # failure here should degrade gracefully, not crash the upload.
-            print(f"[warn] marker-pdf conversion failed ({exc}); falling back to pypdf")
-
+# --------------------------------------------------------------------------- #
+# PDF -> text extraction
+# --------------------------------------------------------------------------- #
+def pdf_to_text(pdf_path: str) -> str:
+    """Extract plain text from a PDF using pypdf."""
     from pypdf import PdfReader
 
     reader = PdfReader(pdf_path)
     pages = [page.extract_text() or "" for page in reader.pages]
-    return "\n\n".join(pages), "pypdf"
+    return "\n\n".join(pages)
 
 
+# --------------------------------------------------------------------------- #
 # Chunking
+# --------------------------------------------------------------------------- #
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
+    """Split text into overlapping chunks, breaking on paragraph boundaries
+    where possible so each chunk stays semantically coherent."""
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if not text:
         return []
@@ -143,6 +149,7 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
 
 
 def retrieve(question: str, k: int):
+    """Embed the question and run semantic search against the vector store."""
     query_embedding = embedding_model.encode(question).tolist()
     results = collection.query(query_embeddings=[query_embedding], n_results=k)
     docs = results["documents"][0] if results.get("documents") else []
@@ -151,12 +158,14 @@ def retrieve(question: str, k: int):
     return docs, metas, dists
 
 
+# --------------------------------------------------------------------------- #
 # FastAPI app
+# --------------------------------------------------------------------------- #
 app = FastAPI(title="RAG Notes API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],  # tighten this to your frontend's origin in production
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -182,7 +191,6 @@ class AskResponse(BaseModel):
 class UploadResponse(BaseModel):
     filename: str
     chunks_indexed: int
-    conversion_method: str
 
 
 class DocumentInfo(BaseModel):
@@ -208,7 +216,7 @@ async def upload_pdf(file: UploadFile = File(...)):
 
     try:
         try:
-            text, method = pdf_to_markdown(tmp_path)
+            text = pdf_to_text(tmp_path)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(500, f"Failed to extract text from PDF: {exc}") from exc
     finally:
@@ -223,6 +231,8 @@ async def upload_pdf(file: UploadFile = File(...)):
 
     embeddings = embedding_model.encode(chunks, show_progress_bar=False).tolist()
 
+    # Re-uploading the same filename replaces its previous chunks instead of
+    # duplicating them.
     existing = collection.get(where={"source": file.filename})
     if existing and existing.get("ids"):
         collection.delete(ids=existing["ids"])
@@ -231,7 +241,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     metadatas = [{"source": file.filename, "chunk": i} for i in range(len(chunks))]
     collection.add(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
 
-    return UploadResponse(filename=file.filename, chunks_indexed=len(chunks), conversion_method=method)
+    return UploadResponse(filename=file.filename, chunks_indexed=len(chunks))
 
 
 @app.post("/ask", response_model=AskResponse)
