@@ -51,7 +51,7 @@ groq_client = None
 if GROQ_API_KEY:
     from groq import Groq
 
-    groq_client = Groq(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
+    groq_client = Groq(api_key=GROQ_API_KEY)
 
 
 def init_models() -> None:
