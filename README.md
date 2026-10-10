@@ -1,6 +1,6 @@
 # RAG Notes — ask questions about your PDF notes
 
-Upload PDF notes, they get converted to markdown, chunked, embedded, and stored
+Upload PDF notes, they get extracted to text, chunked, embedded, and stored
 in a vector database. Ask a question and the app retrieves the most relevant
 chunks and asks an LLM to answer using only that context.
 
@@ -35,21 +35,13 @@ Generated Response
 ### Files
 
 ```
-├── backend.py                 # FastAPI app: upload/ingest, retrieval, LLM generation
-├── requirements.txt           # Backend dependencies (chromadb, pypdf, groq, ...)
-├── frontend/
-│   ├── frontend.py            # Streamlit chat UI, talks to backend over HTTP
-│   └── requirements.txt       # Frontend-only dependencies (streamlit, requests, dotenv)
-├── .env.example
+├── backend.py        # FastAPI app: upload/ingest, retrieval, LLM generation
+├── frontend.py        # Streamlit chat UI, talks to backend over HTTP
+├── requirements.txt    # All Python dependencies (backend + frontend)
+├── .env.example       # Copy to .env and fill in
 ├── .gitignore
 └── README.md
 ```
-
-> **Why two `requirements.txt` files?** The backend's dependencies
-> (`chromadb`, `sentence-transformers`...) pull in `torch` and other sizeable
-> packages. The frontend doesn't need any of that — it only talks to the
-> backend over HTTP. Keeping them separate means the frontend install stays
-> fast and isn't coupled to changes in the RAG stack's dependencies.
 
 ## 1. Setup
 
@@ -66,8 +58,10 @@ Get a free Groq API key at [console.groq.com](https://console.groq.com/keys).
 
 > **Note on PDF extraction:** `pypdf` pulls plain text out of each page. It
 > won't reconstruct tables or complex multi-column layouts as cleanly as a
-> layout-aware tool would, but it's fast, dependency-light, and good enough
-> for most lecture notes and text-heavy PDFs.
+> layout-aware OCR tool would, but it's fast, lightweight, and good enough
+> for most lecture notes and text-heavy PDFs. If a PDF is scanned/image-only
+> (no selectable text), extraction will return nothing — `/upload` will
+> report that clearly rather than silently indexing an empty document.
 
 ## 2. Run locally
 
@@ -77,11 +71,10 @@ In one terminal, start the backend:
 uvicorn backend:app --reload --port 8000
 ```
 
-In another terminal, install the frontend's (separate, lighter) dependencies and start it:
+In another terminal, start the frontend:
 
 ```bash
-pip install -r frontend/requirements.txt
-streamlit run frontend/frontend.py
+streamlit run frontend.py
 ```
 
 Open the Streamlit URL it prints (usually `http://localhost:8501`), upload a
@@ -93,7 +86,7 @@ chat box.
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health` | Health check, reports whether `GROQ_API_KEY` is set |
-| `POST` | `/upload` | `multipart/form-data` with a `file` field (PDF). Converts, chunks, embeds, and indexes it |
+| `POST` | `/upload` | `multipart/form-data` with a `file` field (PDF). Extracts, chunks, embeds, and indexes it |
 | `POST` | `/ask` | JSON `{"question": "...", "top_k": 4}`. Returns `{"answer": "...", "sources": [...]}` |
 | `GET` | `/documents` | Lists indexed documents and their chunk counts |
 | `DELETE` | `/documents/{filename}` | Removes a document's chunks from the index |
@@ -121,24 +114,26 @@ chat box.
 
 ### Frontend → Streamlit Community Cloud (or a second Railway service)
 
-1. Go to [share.streamlit.io](https://share.streamlit.io) → **New app**, pick
-   your repo/branch, and set **Main file path** to `frontend/frontend.py`.
-   Streamlit Cloud automatically looks for a `requirements.txt` in the same
-   directory as the main file, so it will pick up `frontend/requirements.txt`
-   (the lightweight one) instead of the backend's.
-2. In the app's **Settings → Secrets**, add:
+1. Deploy `frontend.py` the same way (new Railway service, or
+   [share.streamlit.io](https://share.streamlit.io)).
+2. Set `BACKEND_URL` (in Streamlit Cloud: **Settings → Secrets**) to your
+   backend's public URL from the step above, e.g.:
    ```
    BACKEND_URL = "https://your-app.up.railway.app"
    ```
-   (your Railway backend URL, no trailing slash).
-3. Deploy. The install should now only pull `streamlit`, `requests`, and
-   `python-dotenv` — a few seconds, not several minutes.
+3. If using Railway for the frontend too, set the start command:
+   ```
+   streamlit run frontend.py --server.port $PORT --server.address 0.0.0.0
+   ```
 
-If using Railway for the frontend instead, set the service's root directory
-to `frontend/` and the start command to:
-```
-streamlit run frontend.py --server.port $PORT --server.address 0.0.0.0
-```
+> **Heads up:** this project uses a single `requirements.txt` for both
+> services, which includes `sentence-transformers` (and therefore `torch`).
+> The frontend doesn't actually need it — it only talks to the backend over
+> HTTP — so the Streamlit install will take noticeably longer and pull more
+> than it strictly needs. That's the tradeoff for keeping one shared
+> requirements file; if install time on Streamlit Cloud becomes a problem,
+> the fix is to give the frontend its own minimal `requirements.txt`
+> (`streamlit`, `requests`, `python-dotenv`) in a separate folder or repo.
 
 ## 5. Configuration reference (`.env`)
 
@@ -158,6 +153,8 @@ streamlit run frontend.py --server.port $PORT --server.address 0.0.0.0
   than duplicating them.
 - Answers are grounded strictly in retrieved context — the system prompt
   instructs the model to say it doesn't know rather than guess.
+- Scanned/image-only PDFs won't extract any text with `pypdf`; adding OCR
+  (e.g. `pytesseract`) is the natural next step if you need to support those.
 - Ideas to extend: multi-user auth, chat history persisted server-side,
   swapping Chroma for a hosted vector DB (Pinecone/Qdrant) for durability
   without Railway volumes, streaming responses, re-ranking retrieved chunks.

@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 
 load_dotenv()
@@ -95,9 +96,7 @@ async def lifespan(app: FastAPI):
 # PDF -> text extraction
 # --------------------------------------------------------------------------- #
 def pdf_to_text(pdf_path: str) -> str:
-    """Extract plain text from a PDF using pypdf."""
-    from pypdf import PdfReader
-
+    """Extract plain text from a PDF, page by page, using pypdf."""
     reader = PdfReader(pdf_path)
     pages = [page.extract_text() or "" for page in reader.pages]
     return "\n\n".join(pages)
@@ -223,7 +222,11 @@ async def upload_pdf(file: UploadFile = File(...)):
         os.unlink(tmp_path)
 
     if not text.strip():
-        raise HTTPException(400, "No extractable text found in this PDF.")
+        raise HTTPException(
+            400,
+            "No extractable text found in this PDF. It may be a scanned/image-only "
+            "document, which plain text extraction can't read.",
+        )
 
     chunks = chunk_text(text)
     if not chunks:

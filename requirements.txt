@@ -15,3 +15,6 @@ groq>=0.9
 # --- PDF text extraction ---
 pypdf>=4.2
 
+# --- Frontend ---
+streamlit>=1.33
+requests>=2.31
