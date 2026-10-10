@@ -28,7 +28,7 @@ load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 # Groq SDK appends /chat/completions; do not add that path here.
-GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"  # Hardcoded Groq API base URL
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_db")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "notes")
@@ -271,7 +271,7 @@ async def ask(request: AskRequest):
         print(f"Groq completion failed ({type(exc).__name__}): {exc}")
         raise HTTPException(
             status_code=502,
-            detail=f"Groq API request failed. Verify GROQ_BASE_URL, GROQ_API_KEY, and GROQ_MODEL. ({type(exc).__name__})",
+            detail=f"Groq API request failed. Verify GROQ_API_KEY and GROQ_MODEL. ({type(exc).__name__})",
         ) from exc
 
     answer = completion.choices[0].message.content or "I don't know based on the provided notes."
